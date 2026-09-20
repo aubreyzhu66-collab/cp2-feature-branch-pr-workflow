@@ -1,0 +1,32 @@
+name: "Submit CP2"
+description: "Submit your completed public CP2 practice repository for automatic and teacher grading."
+title: "[CP2] Feature Branch & Pull Request Submission"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Submit only after the CP2 Pull Request has received an **APPROVED** review and has been merged into `main`.
+
+        The completed public CP2 repository is detected automatically from the GitHub account that opens this submission.
+
+  - type: markdown
+    attributes:
+      value: |
+        **Repository URL and GitHub username are detected automatically.**
+        Do not enter a PR number or repository URL manually.
+
+  - type: checkboxes
+    id: integrity
+    attributes:
+      label: Completion Check
+      options:
+        - label: I used the official KLIS-CS CP2 Copy Exercise.
+          required: true
+        - label: My Pull Request used the required cp2-USERNAME branch and targeted main.
+          required: true
+        - label: Another GitHub user submitted an APPROVED review before I merged the Pull Request.
+          required: true
+        - label: The Pull Request is merged into main.
+          required: true
+        - label: I did not include passwords, API keys, tokens, or other secrets.
+          required: true

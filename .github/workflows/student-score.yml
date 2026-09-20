@@ -1,0 +1,100 @@
+name: CP2 — Student Score
+
+on:
+  workflow_run:
+    workflows: ["Checkpoint 2 — Auto and Teacher Grade"]
+    types: [completed]
+  schedule:
+    - cron: '23 * * * *'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  score:
+    if: ${{ github.repository != 'KLIS-CS/GitHub-Feature-Branch-Pull-Request-Workflow' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Sync teacher score into Exercise Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const exerciseMarker = '<!-- klis-cp2-exercise -->';
+            const progressMarker = '<!-- klis-cp2-progress -->';
+            const teacherStart = '<!-- klis-cp2-teacher-sync-start -->';
+            const teacherEnd = '<!-- klis-cp2-teacher-sync-end -->';
+
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'all', per_page: 100
+            });
+            const exercise = issues.find(i => !i.pull_request && i.body?.includes(exerciseMarker));
+            if (!exercise) {
+              core.info('Exercise Issue not found yet.');
+              return;
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: exercise.number, per_page: 100
+            });
+            const progress = comments.find(c => c.user?.login === 'github-actions[bot]' && c.body?.includes(progressMarker));
+            if (!progress) {
+              core.info('Automatic grading comment not found yet.');
+              return;
+            }
+
+            const automatic = Math.max(
+              0,
+              Math.min(60, Number(progress.body?.match(/\*\*Automatic score:\*\*\s*(\d+)\/60/i)?.[1] || 0))
+            );
+
+            let teacher = null;
+            let grader = null;
+            let feedback = '';
+            let updatedAt = null;
+            const gradeUrl = `https://raw.githubusercontent.com/KLIS-CS/GitHub-Feature-Branch-Pull-Request-Workflow/grades/.cp2-grades/${encodeURIComponent(owner.toLowerCase())}.json?ts=${Date.now()}`;
+            const response = await fetch(gradeUrl, { headers: { 'User-Agent': 'KLIS-CS-CP2-Student-Score' } });
+            if (response.ok) {
+              const grade = await response.json();
+              if (Number.isInteger(grade.teacherScore)) teacher = grade.teacherScore;
+              grader = grade.grader || null;
+              feedback = grade.feedback || '';
+              updatedAt = grade.updatedAt || null;
+            } else if (response.status !== 404) {
+              core.warning(`Teacher grade sync returned HTTP ${response.status}.`);
+            }
+
+            const total = automatic + (teacher ?? 0);
+            const feedbackBlock = teacher === null
+              ? 'Teacher feedback will appear here after grading in the mother repository.'
+              : feedback
+                ? `> ${feedback.replace(/\n/g, '\n> ')}`
+                : '> Teacher grade published. No written feedback was included.';
+
+            const teacherBlock = `${teacherStart}
+            ### 🧑‍🏫 Teacher review
+
+            **Teacher score:** ${teacher === null ? 'awaiting review' : `${teacher}/40${grader ? ` by @${grader}` : ''}`}  
+            **Final score:** ${teacher === null ? 'pending teacher review' : `${total}/100`}
+
+            ${teacher === null ? '🔵 **Awaiting teacher review.**' : `✅ **FINAL SCORE: ${total}/100**`}
+
+            #### Teacher feedback
+            ${feedbackBlock}
+            ${updatedAt ? `\n_Last synced: ${updatedAt}_` : ''}
+            ${teacherEnd}`;
+
+            const re = new RegExp(`${teacherStart}[\\s\\S]*?${teacherEnd}`);
+            let body = progress.body || '';
+            if (re.test(body)) body = body.replace(re, teacherBlock);
+            else body += `\n\n${teacherBlock}`;
+
+            await github.rest.issues.updateComment({
+              owner, repo, comment_id: progress.id, body
+            });
+
+            await core.summary
+              .addHeading(`CP2: ${teacher === null ? `${automatic}/60 automatic` : `${total}/100`}`)
+              .write();

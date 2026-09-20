@@ -1,0 +1,244 @@
+name: Checkpoint 2 — Auto Grade
+
+on:
+  push:
+    branches: ['cp2-*']
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited, closed]
+    branches: [main]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: write
+
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Grade checkpoint
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const marker = '<!-- klis-cp2-progress -->';
+            const starter = 'STARTER: Replace this line on your CP2 feature branch with a short description of your change.';
+
+            let eventPR = null;
+            if (['pull_request_target', 'pull_request_review'].includes(context.eventName)) {
+              eventPR = context.payload.pull_request;
+            }
+
+            const username = eventPR ? eventPR.user.login : context.actor;
+            const expectedBranch = `cp2-${username}`;
+
+            let branchExists = false;
+            try {
+              await github.rest.repos.getBranch({ owner, repo, branch: expectedBranch });
+              branchExists = true;
+            } catch (e) {
+              if (e.status !== 404) throw e;
+            }
+
+            const pulls = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'all', per_page: 100
+            });
+            const candidates = pulls
+              .filter(p =>
+                p.head.ref === expectedBranch &&
+                p.base.ref === 'main' &&
+                p.user.login.toLowerCase() === username.toLowerCase()
+              )
+              .sort((a, b) => b.number - a.number);
+
+            const prSummary = candidates[0] || null;
+            const pr = prSummary
+              ? (await github.rest.pulls.get({ owner, repo, pull_number: prSummary.number })).data
+              : null;
+
+            const readAt = async (filePath, ref) => {
+              if (!ref) return '';
+              try {
+                const r = await github.rest.repos.getContent({ owner, repo, path: filePath, ref });
+                if (Array.isArray(r.data) || !r.data.content) return '';
+                return Buffer.from(r.data.content, r.data.encoding).toString('utf8');
+              } catch (e) {
+                if (e.status === 404) return '';
+                throw e;
+              }
+            };
+
+            const headRef = pr?.head?.sha || (branchExists ? expectedBranch : null);
+            const feature = await readAt('feature.txt', headRef);
+            const submission = await readAt('submission.md', headRef);
+
+            const featureChanged =
+              feature.trim() !== starter &&
+              feature.trim().length >= 20;
+
+            let commitCount = 0;
+            if (pr) {
+              const commits = await github.paginate(github.rest.pulls.listCommits, {
+                owner, repo, pull_number: pr.number, per_page: 100
+              });
+              commitCount = commits.length;
+            } else if (branchExists) {
+              try {
+                const compare = await github.rest.repos.compareCommits({
+                  owner, repo, base: 'main', head: expectedBranch
+                });
+                commitCount = compare.data.ahead_by || 0;
+              } catch (e) {
+                core.info(`Compare failed: ${e.message}`);
+              }
+            }
+
+            let changedNames = [];
+            if (pr) {
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner, repo, pull_number: pr.number, per_page: 100
+              });
+              changedNames = files.map(f => f.filename);
+            }
+            const allowed = new Set(['feature.txt', 'submission.md']);
+            const allowedFiles =
+              Boolean(pr) &&
+              changedNames.includes('feature.txt') &&
+              changedNames.includes('submission.md') &&
+              changedNames.every(name => allowed.has(name));
+
+            const field = label =>
+              submission.match(new RegExp(`^${label}:\\s*(\\S.*)$`, 'mi'))?.[1]?.trim() || '';
+            const answer = heading =>
+              submission.match(new RegExp(`## ${heading}[\\s\\S]*?\\nAnswer:\\s*([\\s\\S]*?)(?=\\n## |$)`, 'i'))?.[1]?.trim() || '';
+            const commandBlock =
+              submission.match(/## Commands Used[\s\S]*?```text\s*([\s\S]*?)```/i)?.[1]?.trim() || '';
+
+            const submittedUsername = field('GitHub Username').replace(/^@/, '').trim();
+            const submittedBranch = field('Required Branch').replace(/^`|`$/g, '').trim();
+            const metadataCorrect =
+              submittedUsername.toLowerCase() === username.toLowerCase() &&
+              submittedBranch.toLowerCase() === expectedBranch.toLowerCase();
+
+            const submissionComplete =
+              Boolean(field('Name')) &&
+              metadataCorrect &&
+              commandBlock.length >= 10 &&
+              ['Question 1', 'Question 2', 'Question 3', 'Reflection'].every(h => Boolean(answer(h)));
+
+            const reviews = pr
+              ? await github.paginate(github.rest.pulls.listReviews, {
+                  owner, repo, pull_number: pr.number, per_page: 100
+                })
+              : [];
+            const approvals = reviews
+              .filter(r =>
+                r.state === 'APPROVED' &&
+                r.user?.type === 'User' &&
+                r.user?.login?.toLowerCase() !== username.toLowerCase() &&
+                r.submitted_at
+              )
+              .sort((a, b) => new Date(a.submitted_at) - new Date(b.submitted_at));
+
+            const approvedBeforeMerge = approvals.find(r =>
+              !pr?.merged_at || new Date(r.submitted_at) <= new Date(pr.merged_at)
+            ) || null;
+            const mergedAfterApproval = Boolean(pr?.merged_at && approvedBeforeMerge);
+            const correctBranch = Boolean(pr?.head?.ref === expectedBranch) || branchExists;
+
+            const checks = [
+              ['Correct checkpoint branch identity', correctBranch ? 5 : 0, 5,
+                correctBranch ? (pr ? `${expectedBranch} via PR #${pr.number}` : expectedBranch) : `expected ${expectedBranch}`],
+              ['feature.txt changed on PR head', featureChanged ? 10 : 0, 10,
+                featureChanged ? 'feature change detected' : 'replace the starter line on the CP2 branch'],
+              ['Commit evidence on feature branch', commitCount >= 1 ? 5 : 0, 5,
+                commitCount >= 1 ? `${commitCount} commit(s)` : 'commit the CP2 work'],
+              ['Pull Request targets main', pr ? 5 : 0, 5,
+                pr ? `PR #${pr.number}: ${expectedBranch} → main` : 'open the required Pull Request'],
+              ['PR changes only allowed files', allowedFiles ? 5 : 0, 5,
+                allowedFiles ? changedNames.join(', ') : (pr ? `changed: ${changedNames.join(', ') || 'none'}` : 'waiting for PR')],
+              ['Submission complete on PR head', submissionComplete ? 10 : 0, 10,
+                submissionComplete ? 'identity, commands, answers, and reflection complete' : 'complete submission.md on the CP2 branch'],
+              ['APPROVED review before merge', approvedBeforeMerge ? 10 : 0, 10,
+                approvedBeforeMerge ? `approved by @${approvedBeforeMerge.user.login} at ${approvedBeforeMerge.submitted_at}` : 'get an APPROVED review from another user before merge'],
+              ['Pull Request merged after approval', mergedAfterApproval ? 10 : 0, 10,
+                mergedAfterApproval ? `merged at ${pr.merged_at}` : 'merge only after approval']
+            ];
+
+            const automatic = checks.reduce((sum, [, earned]) => sum + earned, 0);
+            const rows = checks.map(([label, earned, max, detail]) =>
+              `| ${earned === max ? '✅' : earned ? '🟨' : '⬜'} ${label} | ${earned}/${max} | ${detail} |`
+            ).join('\n');
+
+            const defaultTeacherBlock = `<!-- klis-cp2-teacher-sync-start -->
+            ### 🧑‍🏫 Teacher review
+
+            **Teacher score:** awaiting review  
+            **Final score:** pending teacher review
+
+            Teacher feedback will appear here after grading in the mother repository.
+            <!-- klis-cp2-teacher-sync-end -->`;
+
+            const status = automatic < 60
+              ? '🟡 **IN PROGRESS — complete the missing automatic evidence.**'
+              : '🔵 **AUTOMATIC CHECKS PASSED — reviewed, merged, and ready for teacher review.**';
+
+            const progressBody = `${marker}
+            ## CP2 — Progress & Score
+
+            **Student:** @${username}  
+            **Repository:** https://github.com/${owner}/${repo}  
+            **Automatic score:** ${automatic}/60
+
+            | Check | Score | Evidence |
+            |---|---:|---|
+            ${rows}
+
+            ${status}
+
+            > The feature branch may be deleted after merge. The grader uses the Pull Request head SHA and review/merge history.
+
+            ## Submit for teacher review
+
+            [Submit CP2 to the mother repository](https://github.com/KLIS-CS/GitHub-Feature-Branch-Pull-Request-Workflow/issues/new?template=cp2-submission.yml)
+
+            ${defaultTeacherBlock}`;
+
+            const allIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'all', per_page: 100
+            });
+            let exercise = allIssues.find(i => !i.pull_request && i.body?.includes('<!-- klis-cp2-exercise -->'));
+            if (!exercise) {
+              exercise = (await github.rest.issues.create({
+                owner,
+                repo,
+                title: 'Exercise: Checkpoint 2 — Feature Branch & Pull Request Workflow',
+                body: '<!-- klis-cp2-exercise -->\n## Checkpoint 2 — Feature Branch & Pull Request Workflow'
+              })).data;
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: exercise.number, per_page: 100
+            });
+            const old = comments.find(c => c.user?.type === 'Bot' && c.body?.includes(marker));
+            let finalBody = progressBody;
+            const teacherMatch = old?.body?.match(/<!-- klis-cp2-teacher-sync-start -->[\s\S]*?<!-- klis-cp2-teacher-sync-end -->/);
+            if (teacherMatch) finalBody = finalBody.replace(defaultTeacherBlock, teacherMatch[0]);
+
+            if (old) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: old.id, body: finalBody });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: exercise.number, body: finalBody });
+            }
+
+            await core.summary
+              .addHeading(`Checkpoint 2: ${automatic}/60 automatic`)
+              .addRaw(`Automatic: ${automatic}/60\n`)
+              .write();
+
+            if (automatic !== 60 && ['push', 'pull_request_target'].includes(context.eventName)) {
+              core.setFailed(`Automatic score is ${automatic}/60.`);
+            }

@@ -1,0 +1,291 @@
+name: CP2 — Mother Repository Grader
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  grade:
+    if: >-
+      ${{
+        github.repository == 'KLIS-CS/GitHub-Feature-Branch-Pull-Request-Workflow' &&
+        !github.event.issue.pull_request &&
+        (
+          startsWith(github.event.issue.title, '[CP2] Feature Branch & Pull Request Submission') ||
+          contains(github.event.issue.body, '### Practice Repository URL')
+        )
+      }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Grade CP2 submission
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue = context.payload.issue;
+            const issueNumber = issue.number;
+            const student = issue.user.login;
+            const marker = '<!-- klis-cp2-mother-score -->';
+            const localMarker = '<!-- klis-cp2-progress -->';
+            const allowedGraders = new Set(['hbycwyh2008']);
+
+            const escapeRegex = value => value.replace(/[.*+?^$()|[\]\\]/g, '\\$&');
+            const section = label => {
+              const re = new RegExp(`### ${escapeRegex(label)}\\s*\\n+([\\s\\S]*?)(?=\\n### |$)`, 'i');
+              const value = issue.body?.match(re)?.[1]?.trim() || '';
+              return value === '_No response_' ? '' : value;
+            };
+
+            function parseRepoUrl(value) {
+              try {
+                const u = new URL((value || '').trim());
+                if (u.protocol !== 'https:' || u.hostname.toLowerCase() !== 'github.com') return null;
+                const parts = u.pathname.split('/').filter(Boolean);
+                if (parts.length < 2) return null;
+                return { owner: parts[0], repo: parts[1].replace(/\.git$/i, '') };
+              } catch { return null; }
+            }
+
+            async function publicJson(url) {
+              const r = await fetch(url, {
+                headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'KLIS-CS-CP2-Mother-Grader' }
+              });
+              if (r.status === 404) return null;
+              if (r.status === 403 || r.status === 429) throw new Error('GitHub API rate limit reached. Re-run later; this is not a student error.');
+              if (!r.ok) throw new Error(`GitHub API returned ${r.status} for ${url}`);
+              return await r.json();
+            }
+
+            function parseManualGrade(body) {
+              if (!body) return null;
+              const legacy = body.match(/(?:^|\n)\s*\/manual-grade\s+(40|[0-3]?\d)(?:\s|$)/i);
+              if (legacy) return { score: Number(legacy[1]), breakdown: null, feedback: '' };
+              if (!/(?:^|\n)\s*\/manual-grade\s*(?:\n|$)/i.test(body)) return null;
+
+              const readTen = label => {
+                const m = body.match(new RegExp(`^\\s*${escapeRegex(label)}:\\s*(10|[0-9])\\s*\\/\\s*10\\s*$`, 'mi'));
+                return m ? Number(m[1]) : null;
+              };
+              const breakdown = {
+                branch: readTen('Branch safety'),
+                workflow: readTen('Git workflow explanation'),
+                pr: readTen('Pull Request understanding'),
+                reflection: readTen('Reflection & work quality')
+              };
+              if (Object.values(breakdown).some(v => v === null)) return null;
+              const feedback = body.match(/(?:^|\n)\s*Feedback:\s*\n([\s\S]*)$/i)?.[1]?.trim() || '';
+              return { score: Object.values(breakdown).reduce((a,b) => a+b, 0), breakdown, feedback };
+            }
+
+            async function discoverRepositoryUrl() {
+              try {
+                const exact = await github.rest.repos.get({ owner: student, repo: 'cp2-feature-branch-pr-workflow' });
+                if (exact.data && exact.data.private === false) return exact.data.html_url;
+              } catch (error) {
+                if (error.status !== 404) core.warning(`Exact CP2 repository lookup failed: ${error.message}`);
+              }
+
+              const repos = await github.paginate(github.rest.repos.listForUser, {
+                username: student, per_page: 100, sort: 'updated', direction: 'desc'
+              });
+              for (const candidate of repos.slice(0, 40)) {
+                if (candidate.private) continue;
+                try {
+                  const details = await github.rest.repos.get({ owner: student, repo: candidate.name });
+                  if (details.data.template_repository?.full_name === 'KLIS-CS/GitHub-Feature-Branch-Pull-Request-Workflow') return details.data.html_url;
+
+                  const workflow = await github.rest.repos.getContent({
+                    owner: student,
+                    repo: candidate.name,
+                    path: '.github/workflows/grade.yml',
+                    ref: candidate.default_branch || 'main'
+                  });
+                  if (!Array.isArray(workflow.data) && workflow.data.content) {
+                    const text = Buffer.from(workflow.data.content, workflow.data.encoding).toString('utf8');
+                    if (text.includes('klis-cp2-progress')) return candidate.html_url;
+                  }
+                } catch (error) {
+                  if (error.status !== 404) core.warning(`Skipping ${candidate.name}: ${error.message}`);
+                }
+              }
+              return '';
+            }
+
+            let repositoryUrl = section('Practice Repository URL');
+            if (!repositoryUrl) repositoryUrl = await discoverRepositoryUrl();
+
+            if (repositoryUrl && !section('Practice Repository URL')) {
+              const autoDetected = [
+                issue.body || '',
+                '',
+                '### Practice Repository URL',
+                repositoryUrl,
+                '',
+                '### GitHub Username',
+                student
+              ].join('\n');
+              await github.rest.issues.update({ owner, repo, issue_number: issueNumber, body: autoDetected });
+            }
+
+            const parsed = parseRepoUrl(repositoryUrl);
+            let automatic = 0;
+            let progressUrl = null;
+            let validation = 'Repository URL could not be parsed.';
+
+            if (parsed) {
+              const api = `https://api.github.com/repos/${encodeURIComponent(parsed.owner)}/${encodeURIComponent(parsed.repo)}`;
+              const meta = await publicJson(api);
+              if (!meta) validation = 'Repository not found.';
+              else if (meta.private) validation = 'Repository is private. CP2 must be Public.';
+              else if (meta.owner?.login?.toLowerCase() !== student.toLowerCase()) {
+                validation = `Repository must belong to @${student}.`;
+              } else {
+                validation = 'Public student-owned repository detected.';
+                const issues = await publicJson(`${api}/issues?state=all&per_page=100`) || [];
+                const candidates = [];
+                for (const item of issues) {
+                  if (!item.comments) continue;
+                  const localComments = await publicJson(`${api}/issues/${item.number}/comments?per_page=100`) || [];
+                  for (const c of localComments) {
+                    if (c.user?.login === 'github-actions[bot]' && c.body?.includes(localMarker)) {
+                      candidates.push({ ...c, parent: item });
+                    }
+                  }
+                }
+                candidates.sort((a,b) => new Date(b.updated_at || b.created_at) - new Date(a.updated_at || a.created_at));
+                const trusted = candidates[0];
+                if (trusted) {
+                  progressUrl = trusted.html_url || trusted.parent?.html_url || null;
+                  const m = (trusted.body || '').match(/\*\*Automatic(?: score)?:\*\*\s*(\d+)\/60/i);
+                  if (m) automatic = Math.max(0, Math.min(60, Number(m[1])));
+                  validation += ` Trusted CP2 grader output found (${automatic}/60).`;
+                } else {
+                  validation += ' No trusted CP2 grader output found yet.';
+                }
+              }
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: issueNumber, per_page: 100
+            });
+            let manual = null;
+            for (const c of [...comments].sort((a,b) => new Date(b.updated_at) - new Date(a.updated_at))) {
+              if (!allowedGraders.has(c.user?.login?.toLowerCase())) continue;
+              const grade = parseManualGrade(c.body || '');
+              if (grade) { manual = { ...grade, grader: c.user.login }; break; }
+            }
+
+            const teacher = manual?.score ?? 0;
+            const total = automatic + teacher;
+            const finalLine = manual ? `${total}/100` : 'pending teacher review';
+            const status = automatic < 60
+              ? '🟡 **IN PROGRESS — finish the reviewed/merged workflow in the student repository.**'
+              : !manual
+                ? '🔵 **AUTOMATIC CHECKS PASSED — awaiting teacher review.**'
+                : `✅ **FINAL SCORE: ${total}/100**`;
+
+            const template = [
+              '```text',
+              '/manual-grade',
+              'Branch safety: 0/10',
+              'Git workflow explanation: 0/10',
+              'Pull Request understanding: 0/10',
+              'Reflection & work quality: 0/10',
+              '',
+              'Feedback:',
+              'Write concise feedback here.',
+              '```'
+            ].join('\n');
+
+            const canonicalRepo = parsed ? `https://github.com/${parsed.owner}/${parsed.repo}` : repositoryUrl;
+            const body = `${marker}
+            ## CP2 Score — Mother Repository
+
+            **Student:** @${student}  
+            **Repository:** ${canonicalRepo || 'not detected'}  
+            **Automatic:** **${automatic}/60**  
+            **Teacher:** **${manual ? `${teacher}/40` : 'pending /40'}**  
+            **Final:** **${finalLine}**
+
+            | Component | Score | Evidence |
+            |---|---:|---|
+            | ${automatic === 60 ? '✅' : automatic ? '🟨' : '⬜'} Trusted student automatic grader | ${automatic}/60 | ${validation} |
+            | 🧑‍🏫 Teacher review | ${manual ? `${teacher}/40` : '—/40'} | ${manual ? `graded by @${manual.grader}` : 'awaiting review'} |
+
+            ${status}
+
+            ### Review links
+            - ${canonicalRepo ? `[Open student repository](${canonicalRepo})` : 'Student repository unavailable'}
+            - ${progressUrl ? `[Open trusted CP2 progress evidence](${progressUrl})` : 'Trusted CP2 progress evidence not found'}
+
+            > Full automatic credit requires a human APPROVED review before merge. The feature branch may be deleted after merge.
+
+            ### Teacher grading
+
+            ${template}
+
+            **Re-grade:** after the student changes the repository, edit this submission Issue or add a comment.
+            `;
+
+            const old = comments.find(c => c.user?.type === 'Bot' && c.body?.includes(marker));
+            if (old) await github.rest.issues.updateComment({ owner, repo, comment_id: old.id, body });
+            else await github.rest.issues.createComment({ owner, repo, issue_number: issueNumber, body });
+
+            if (manual && parsed?.owner) {
+              const gradeBranch = 'grades';
+              try {
+                await github.rest.git.getRef({ owner, repo, ref: `heads/${gradeBranch}` });
+              } catch (e) {
+                if (e.status !== 404) throw e;
+                const mainRef = await github.rest.git.getRef({ owner, repo, ref: 'heads/main' });
+                await github.rest.git.createRef({
+                  owner, repo, ref: `refs/heads/${gradeBranch}`, sha: mainRef.data.object.sha
+                });
+              }
+
+              const gradePath = `.cp2-grades/${student.toLowerCase()}.json`;
+              const gradeData = {
+                version: 2,
+                checkpoint: 'CP2',
+                student: student.toLowerCase(),
+                repository: canonicalRepo,
+                automaticAtMother: automatic,
+                teacherScore: teacher,
+                finalAtMother: total,
+                grader: manual.grader,
+                breakdown: manual.breakdown,
+                feedback: manual.feedback || '',
+                submissionIssue: `https://github.com/${owner}/${repo}/issues/${issueNumber}`,
+                updatedAt: new Date().toISOString()
+              };
+
+              let sha;
+              try {
+                const current = await github.rest.repos.getContent({
+                  owner, repo, path: gradePath, ref: gradeBranch
+                });
+                if (!Array.isArray(current.data)) sha = current.data.sha;
+              } catch (e) {
+                if (e.status !== 404) throw e;
+              }
+
+              await github.rest.repos.createOrUpdateFileContents({
+                owner, repo, path: gradePath, branch: gradeBranch,
+                message: `Publish CP2 teacher grade for ${student}`,
+                content: Buffer.from(JSON.stringify(gradeData, null, 2) + '\n').toString('base64'),
+                ...(sha ? { sha } : {})
+              });
+            }
+
+            await core.summary
+              .addHeading(`CP2: ${total}/100`)
+              .addRaw(`Automatic: ${automatic}/60\n`)
+              .addRaw(`Teacher: ${manual ? `${teacher}/40` : 'awaiting review'}\n`)
+              .write();

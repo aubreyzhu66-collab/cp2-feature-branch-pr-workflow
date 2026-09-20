@@ -1,0 +1,66 @@
+name: CP2 Assessment Self-Test
+
+on:
+  push:
+    branches: [main]
+    paths: ['README.md','submission.md','TEACHER-GRADING.md','feature.txt','.github/**']
+  pull_request:
+    branches: [main]
+    paths: ['README.md','submission.md','TEACHER-GRADING.md','feature.txt','.github/**']
+
+permissions:
+  contents: read
+
+jobs:
+  structural-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate CP2 assessment
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in README.md feature.txt submission.md TEACHER-GRADING.md .github/pull_request_template.md .github/ISSUE_TEMPLATE/cp2-submission.yml .github/workflows/0-start-exercise.yml .github/workflows/grade.yml .github/workflows/grade-external-submission.yml .github/workflows/student-score.yml; do
+            test -f "$f" || { echo "Missing $f"; exit 1; }
+          done
+
+          grep -q 'cp2-YOUR-GITHUB-USERNAME' README.md
+          grep -q 'APPROVED' README.md
+          grep -q 'merge' README.md
+          grep -q 'Pull Request.*merged after approval' README.md
+          grep -q '^STARTER: Replace this line on your CP2 feature branch' feature.txt
+
+          grep -q 'stored \*\*head commit\*\*' submission.md
+          grep -q 'Push, Pull Request, Review, Merge' submission.md
+          ! grep -q 'Pull Request Number:' submission.md
+
+          grep -q 'pull_request_review:' .github/workflows/grade.yml
+          grep -q 'listReviews' .github/workflows/grade.yml
+          grep -q "r.state === 'APPROVED'" .github/workflows/grade.yml
+          grep -q 'mergedAfterApproval' .github/workflows/grade.yml
+          grep -q 'pr?.head?.sha' .github/workflows/grade.yml
+          grep -q 'PR changes only allowed files' .github/workflows/grade.yml
+          grep -q 'klis-cp2-progress' .github/workflows/grade.yml
+          ! grep -q "p.state === 'open'" .github/workflows/grade.yml
+
+          grep -q 'APPROVED' .github/workflows/0-start-exercise.yml
+          grep -q 'Merge only after approval' .github/workflows/0-start-exercise.yml
+          grep -q 'APPROVED' .github/pull_request_template.md
+          grep -q 'APPROVED review before I merged' .github/ISSUE_TEMPLATE/cp2-submission.yml
+
+          grep -q 'klis-cp2-mother-score' .github/workflows/grade-external-submission.yml
+          grep -q 'klis-cp2-progress' .github/workflows/grade-external-submission.yml
+          grep -q 'Trusted CP2 grader output' .github/workflows/grade-external-submission.yml
+          grep -q '.cp2-grades/' .github/workflows/grade-external-submission.yml
+
+          grep -q 'klis-cp2-exercise' .github/workflows/student-score.yml
+          grep -q 'klis-cp2-teacher-sync-start' .github/workflows/student-score.yml
+
+          grep -q 'Pull Request understanding: 0/10' TEACHER-GRADING.md
+          echo 'CP2 reviewed-merge assessment structure is valid.'
+
+      - name: Validate workflow YAML syntax
+        shell: bash
+        run: |
+          ruby -e 'require "yaml"; ARGV.each { |f| YAML.load_file(f); puts "OK #{f}" }'             .github/workflows/0-start-exercise.yml             .github/workflows/grade.yml             .github/workflows/grade-external-submission.yml             .github/workflows/student-score.yml             .github/workflows/template-self-test.yml
